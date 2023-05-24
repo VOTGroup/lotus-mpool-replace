@@ -148,7 +148,7 @@ def main() -> None:
     # Init primary loop
     while True:
         # Log current runtime stats
-        logging.info(f"Running stats: [Replaced: {replaced_messages}] [Average Fee: {average_fee_used}] [Max Fee: {max_fee_used}] [Pending Msgs: {len(pending_messages)}] [Working Msgs: {len(working_messages)}]")
+        logging.info(f"Running stats: [Replacements: {replaced_messages}] [Average Fee: {average_fee_used}] [Max Fee: {max_fee_used}] [Pending Msgs: {len(pending_messages)}] [Working Msgs: {len(working_messages)}]")
         run_processing()
         time.sleep(RUNTIME_INTEVERAL)
    
