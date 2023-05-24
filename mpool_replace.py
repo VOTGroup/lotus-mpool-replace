@@ -44,9 +44,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--working-fee-increase",
-        help="This is the percentage of the minimum fee you would like to add to the next round fee each round (linear mode) or the amount of the previous round fee you want to add to the next round fee each round (exponential mode). (Default: 50%)",
+        help="This is the percentage of the minimum fee you would like to add to the next round fee each round (linear mode) or the amount of the previous round fee you want to add to the next round fee each round (exponential mode). (Default: 25%)",
         type=float,
-        default=os.environ.get("WORKING_FEE_INCREASE", 50),
+        default=os.environ.get("WORKING_FEE_INCREASE", 25),
         required=False,
     )
     parser.add_argument(
