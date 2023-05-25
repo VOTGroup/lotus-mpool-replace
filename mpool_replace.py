@@ -3,7 +3,6 @@
 import argparse
 import os
 import signal
-import statistics
 import subprocess
 import sys
 import time
@@ -77,18 +76,18 @@ options = parse_args()
 
 data = {
     "pending_messages": {
-        # "cid" : "timestamp"
+        # "cid" : "start_epoch"
     },
     "working_messages": {
         # "cid" : {
-        #   "start_time" : "timestamp"
-        #   "round_time" : "timestamp"
+        #   "start_epoch" : "int"
+        #   "round_epoch" : "int"
         #   "round_fee" : "in fil"
         #   "last_round_fee": "in fil"
-        #   "total_time" : "in seconds"
         # }
     },
     "statistics": {
+        "current_epoch" : 0,
         "total_pending": 0,
         "total_worked": 0,
         "total_replaced": 0,
@@ -146,7 +145,7 @@ def processing_pipeline(options: dict):
             for cid in mpool_cids:
                 if cid not in pending_messages and cid not in working_messages:
                     # Init initial tracking stage of message
-                    pending_messages[cid] = time.time()
+                    pending_messages[cid] = statistics["current_epoch"]
                     log.info(f"Pending message: {cid} is new adding to initial pending message tracker.")
                     statistics["total_pending"] += 1
 
@@ -159,11 +158,11 @@ def processing_pipeline(options: dict):
                     del pending_messages[cid]
 
                 # Else if it's not in working messages yet see if it's aged out and add it to working messages
-                elif cid not in working_messages and time.time() - pending_messages[cid] > (options.pending_wait_epochs * 30): # Todo maybe change this to not use seconds
+                elif cid not in working_messages and statistics["current_epoch"] > pending_messages[cid] + options.pending_wait_epochs: 
                     # Add to working messages
                     working_messages[cid] = {
-                        "start_time": pending_messages[cid],
-                        "round_time": pending_messages[cid],
+                        "start_epoch": pending_messages[cid],
+                        "round_epoch": pending_messages[cid],
                         "round_fee": options.min_fee,
                         "last_round_fee": options.min_fee,
                         "current_age": 0
@@ -188,13 +187,12 @@ def processing_pipeline(options: dict):
 
                 # If it is still in the mpool go ahead and replace it with this rounds specifications
                 else:
-                    round_age = time.time() - message["round_time"]
-                    if round_age > (options.working_wait_epochs * 30): # Todo maybe change this to not use seconds
-                        
+                    
+                    if statistics["current_epoch"] > message["round_epoch"] + options.working_wait_epochs:                    
                         # Replace the old message with a new one using this rounds fee
-                        executed_fee = message["round_fee"] if message["round_fee"] <= options.max_fee else options.max_fee
-                        log.info(f"Worker message: {cid} expired designated epochs without posting to chain and will be replaced with a fee of {executed_fee}.")
-                        process = subprocess.Popen(["lotus", "mpool", "replace", "--auto", "--fee-limit", str(executed_fee), cid], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        fee_to_execute = message["round_fee"] if message["round_fee"] <= options.max_fee else options.max_fee
+                        log.info(f"Worker message: {cid} expired designated epochs without posting to chain and will be replaced with a fee of {fee_to_execute}.")
+                        process = subprocess.Popen(["lotus", "mpool", "replace", "--auto", "--fee-limit", str(fee_to_execute), cid], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         stdout, stderr = process.communicate()
                         
                         if stderr:
@@ -212,18 +210,17 @@ def processing_pipeline(options: dict):
                             
                             # Add new message to be tracked and increase the fee for the next round
                             next_round_fee = get_next_round_fee(options, message["round_fee"])
-                            total_age_seconds = time.time() - message["start_time"]
                             working_messages[new_cid] = {
-                                "start_time": message["start_time"],
-                                "round_time": time.time(), 
+                                "start_epoch": message["start_epoch"],
+                                "round_epoch": statistics["current_epoch"], 
                                 "round_fee": next_round_fee,
-                                "last_round_fee": executed_fee,
-                                "total_age_seconds" : total_age_seconds
+                                "last_round_fee": fee_to_execute
                             }
                             del working_messages[cid]
                             # Log out some information
+                            total_age = statistics["current_epoch"] - message["start_epoch"]
                             log.info(f"Worker message: {cid} has been replaced with new worker message: {new_cid}..")
-                            log.info(f"Stats for msg: {new_cid} [Total age: {round(total_age_seconds)} seconds] [Next round fee: {next_round_fee}]")
+                            log.info(f"Stats for new msg: {new_cid} [Total age: {total_age} epochs] [Next round fee: {next_round_fee}]")
                             statistics["total_replaced"] += 1
     except Exception as e:
         log.error(f"Exception thrown: {e}")
@@ -232,11 +229,22 @@ def processing_pipeline(options: dict):
 def check_sync_status() -> bool:
     try:
         # Check if the chain is in sync
-        output = subprocess.check_output(["lotus", "info"])
-        output_str = output.decode('utf-8')
+        output = subprocess.check_output(["lotus", "info"]).decode('utf-8')
+        output_str = output
         if "sync ok" not in output_str:
             return False
         return True
+    except Exception as e:
+        log.error(f"Exception thrown: {e}")
+        return False
+    
+# Used to get the current epoch of the chain
+def get_current_epoch() -> int:
+    try:
+        # Check if the chain is in sync
+        command = "lotus info | awk -F'[ ]' '/epoch/ {gsub(/]/,\"\", $8); print $8}'"
+        output = subprocess.check_output(command, shell=True)
+        return int(output.decode('utf-8'))
     except Exception as e:
         log.error(f"Exception thrown: {e}")
         return False
@@ -244,14 +252,14 @@ def check_sync_status() -> bool:
 # Calculate the next rounds fee based on mode
 def get_next_round_fee(options: dict, current_fee: float) -> float:
     if options.working_fee_mode == "linear":
-        return current_fee + get_percent(options.min_fee, options.working_fee_increase)
+        return current_fee + calc_perc(options.min_fee, options.working_fee_increase)
     elif options.working_fee_mode == "exponential":
-        return current_fee + get_percent(current_fee, options.working_fee_increase)
+        return current_fee + calc_perc(current_fee, options.working_fee_increase)
     else:
         log.error("Working fee mode set incorrectly pass either 'linear' or 'exponetial'")
         return current_fee
      
-def get_percent(number: float, percentage: float):
+def calc_perc(number: float, percentage: float):
     return number * (percentage / 100)
 
 # Runs every epoch based on thread_scheduler
@@ -264,14 +272,18 @@ def run_every_epoch(options: dict):
     working_messages = data["working_messages"]
 
     try:
+        # Tick epoch
+        statistics["current_epoch"] += 1
+
         pen = statistics["total_pending"]
         wrk = statistics["total_worked"]
         rep = statistics["total_replaced"]
         avg = statistics["avg_fee"]
         max = statistics["max_fee"]
+        epc = statistics["current_epoch"]
 
         # Log current runtime statistics
-        log.info(f"Running stats: [Current Pending: {len(pending_messages)}] [Current Working: {len(working_messages)}] [Total Pending: {pen}] [Total Worked: {wrk}] [Total Replacements: {rep}] [Average Fee: {round(avg,9)}] [Max Fee: {round(max,9)}]")
+        log.info(f"Running stats: [Current Pending: {len(pending_messages)}] [Current Working: {len(working_messages)}] [Total Pending: {pen}] [Total Worked: {wrk}] [Total Replacements: {rep}] [Average Fee: {round(avg,9)}] [Max Fee: {round(max,9)}] [Epoch: {epc}]")
 
         # Export or save data each epoch
         if options.data_dir:
@@ -292,7 +304,7 @@ def thread_scheduler(options: dict) -> bool:
 
         # Check that the chain is in sync before scheduling a run could from time to time move timing out an epoch or two
         while not check_sync_status():
-            log.warning(f"Chain out of sync waiting for 1 epoch")
+            log.warning(f"Chain out of sync waiting for 1 epoch or 30 seconds")
             time.sleep(30)
 
         now = datetime.now()
@@ -309,8 +321,10 @@ def thread_scheduler(options: dict) -> bool:
 
 # Program Main
 def main() -> None:
+    
     global options
-
+    global data
+    
     try:
         # Log starting options
         log.info(f"Initializing with options: {options}")
@@ -319,10 +333,12 @@ def main() -> None:
         if options.data_dir:
             import_data(options)
 
-        # Locate next epoch start time
+        # Update current run to real chain epoch, we only do this once and then operate on 30 second time intervals    
+        data["statistics"]["current_epoch"] = get_current_epoch()
+
+        # Move to the next epoch start time before executing run
         now = datetime.now()
-        wait_seconds = 30 - (now.second % 30)
-        
+        wait_seconds = 30 - (now.second % 30)      
         log.info(f"Scheduling first run in {wait_seconds} seconds to sync runtimes with chain epochs.")
 
         # Initialize program thread
