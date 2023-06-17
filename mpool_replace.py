@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 import logging
 import json
+import statistics as pystats
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -56,6 +57,20 @@ def parse_args() -> argparse.Namespace:
         required=False,
     )
     parser.add_argument(
+        "--max-average-fee-epochs",
+        help="This is the amount of epochs that you want to calculate average max fee across. (Default: 2880 ie 24hrs)",
+        type=int,
+        default=os.environ.get("MAX_AVERAGE_FEE_EPOCHS", 2880),
+        required=False,
+    )
+    parser.add_argument(
+        "--max-average-age-epochs",
+        help="This is the amount of epochs that you want to calculate average max age across. (Default: 2880 ie 24hrs)",
+        type=int,
+        default=os.environ.get("MAX_AVERAGE_AGE_EPOCHS", 2880),
+        required=False,
+    )
+    parser.add_argument(
         "--data-dir",
         help="This program can persist running data over time and allow restarts of the service - if omitted data will not persist beyond each run (Default: /home/user/.mpool_replace/)",
         type=str,
@@ -80,10 +95,11 @@ data = {
     },
     "working_messages": {
         # "cid" : {
-        #   "start_epoch" : "int"
-        #   "round_epoch" : "int"
+        #   "start_epoch" : "initial pending start epoch"
+        #   "round_epoch" : "initial round start epoch"
         #   "round_fee" : "in fil"
         #   "last_round_fee": "in fil"
+        #   "total_age": "in epochs"    
         # }
     },
     "statistics": {
@@ -93,7 +109,12 @@ data = {
         "total_replaced": 0,
         "max_fee": 0,
         "avg_fee": 0,
+        "max_age": 0,
         "avg_age": 0
+    },
+    "misc_data": {
+        "fees": [0],
+        "ages": [0]
     }
 }
 dataFile = "mpool_replace.json"
@@ -129,6 +150,7 @@ def processing_pipeline(options: dict):
     statistics = data["statistics"]
     pending_messages = data["pending_messages"]
     working_messages = data["working_messages"]
+    misc_data = data["misc_data"]
 
     try:       
         # Run the lotus command to get the pending messages
@@ -185,9 +207,19 @@ def processing_pipeline(options: dict):
                     # Statistics
                     last_round_fee = message["last_round_fee"]
                     total_age = message["total_age"]
-                    statistics["max_fee"] = last_round_fee if last_round_fee > statistics["max_fee"] else statistics["max_fee"]
-                    statistics["avg_fee"] = last_round_fee if statistics["total_replaced"] == 1 else (statistics["avg_fee"] + last_round_fee) / 2
-                    statistics["avg_age"] = total_age if statistics["total_replaced"] == 1 else (statistics["avg_age"] + total_age) / 2
+                   
+                    misc_data["fees"].append(last_round_fee)
+                    if (len(misc_data["fees"]) > options.max_average_fee_epochs):
+                        misc_data["fees"].pop(0)
+                    statistics["avg_fee"] = round(pystats.mean(misc_data["fees"]), 4)
+                    statistics["max_fee"] = round(last_round_fee if last_round_fee > statistics["max_fee"] else statistics["max_fee"], 4)
+
+                    misc_data["ages"].append(total_age)
+                    if (len(misc_data["ages"]) > options.max_average_age_epochs):
+                        misc_data["ages"].pop(0)
+                    statistics["avg_age"] = round(pystats.mean(misc_data["ages"]), 2)
+                    statistics["max_age"] = round(total_age if total_age > statistics["max_age"] else statistics["max_age"], 2)
+
                     # Remove message
                     del working_messages[cid]
                     log.info(f"Worker message: {cid} was removed from tracking as it was processed on chain with a round fee of {last_round_fee}.")
@@ -271,7 +303,7 @@ def get_next_round_fee(options: dict, current_fee: float) -> float:
 def calc_perc(number: float, percentage: float):
     return number * (percentage / 100)
 
-def log_out_stats():
+def log_out_stats(options: dict):
     global data
     statistics = data["statistics"]
     pending_messages = data["pending_messages"]
@@ -280,17 +312,22 @@ def log_out_stats():
     pen = statistics["total_pending"]
     wrk = statistics["total_worked"]
     rep = statistics["total_replaced"]
-    max = statistics["max_fee"]
-    avg = statistics["avg_fee"]
-    age = statistics["avg_age"]
+    mfe = statistics["max_fee"]
+    afe = statistics["avg_fee"]
+    fep = round(options.max_average_fee_epochs / 2 / 60, 2) 
+    mag = statistics["max_age"]
+    aag = statistics["avg_age"]
+    aep = round(options.max_average_age_epochs / 2 / 60, 2)
     epc = statistics["current_epoch"]
 
     # Log current runtime statistics
     stats_message = (
         "Stats:"
-        f" [Current Pending: {len(pending_messages)}] [Current Working: {len(working_messages)}]"
-        f" [Total Pending: {pen}] [Total Worked: {wrk}] [Total Replaced: {rep}]"
-        f" [Average Fee: {round(avg,9)}] [Max Fee: {round(max,9)}] [Average Age: {round(age)}] [Epoch: {epc}]"
+        f" [Pending: {len(pending_messages)}] [Working: {len(working_messages)}]"
+        f" [Ttl Pending: {pen}] [Ttl Worked: {wrk}] [Ttl Replaced: {rep}]"
+        f" [Avg Fee ({fep} hrs): {round(afe,9)}] [Max Fee: {round(mfe,9)}]"
+        f" [Avg Age ({aep} hrs): {round(aag)}] [Max Age: {mag}]"
+        f" [Epoch: {epc}]"
     )
     log.info(stats_message)
 
@@ -298,14 +335,12 @@ def log_out_stats():
 # Runs every epoch based on thread_scheduler
 def run_every_epoch(options: dict):
     global data
-    statistics = data["statistics"]
-
     try:
         # Tick epoch
-        statistics["current_epoch"] += 1
+        data["statistics"]["current_epoch"] += 1
         
         # Log out stats
-        log_out_stats()
+        log_out_stats(options)
        
         # Export or save data each epoch
         if options.data_dir:
@@ -383,10 +418,15 @@ def main() -> None:
 
 # Cleanup and exit program
 def cleanup_and_exit(signum, frame):
+    global options
     log.info("Received termination signal, cancelling threads.")
     for thread in worker_threads:
         thread.cancel()
     log.info("Threads terminated exiting.")
+    # Export or save data each epoch
+    if options.data_dir:
+        log.info("Saving exit state.")
+        export_data(options)
     exit(0)
 
 # Data persistence stuffs import will create items missing if not found
